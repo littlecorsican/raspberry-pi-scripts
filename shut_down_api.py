@@ -17,7 +17,7 @@ def _shutdown_worker():
     except Exception as e:
         print(f"Shutdown error: {e}")
 
-@app.get("/rpi/shutdown")
+@app.route("/rpi/shutdown", methods=["GET"])
 def shutdown():
     threading.Thread(target=_shutdown_worker, daemon=True).start()
     return jsonify({"status": "ok", "message": "Shutting down now."}), 200
