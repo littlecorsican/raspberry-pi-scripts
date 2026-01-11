@@ -3,6 +3,7 @@ import os
 from werkzeug.utils import secure_filename
 import logging
 from datetime import datetime
+from typing import Optional, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +36,33 @@ def allowed_file(filename):
     """Check if file extension is allowed"""
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def _realpath(path: str) -> str:
+    return os.path.realpath(path)
+
+def resolve_path_under_upload(rel_path: str) -> Tuple[str, str]:
+    """
+    Resolve a user-provided relative path safely under UPLOAD_FOLDER.
+    Returns: (absolute_path, normalized_relative_path)
+    """
+    if rel_path is None:
+        raise ValueError("path is required")
+
+    # Treat both / and \ as separators, forbid absolute paths / traversal.
+    rel = str(rel_path).replace('\\', '/').lstrip('/')
+    norm = os.path.normpath(rel)
+
+    if norm in ("", ".") or norm.startswith("..") or os.path.isabs(norm):
+        raise ValueError("invalid relative path")
+
+    base = _realpath(app.config['UPLOAD_FOLDER'])
+    full = _realpath(os.path.join(base, norm))
+
+    # Ensure 'full' stays within 'base'
+    if full != base and not full.startswith(base + os.sep):
+        raise ValueError("path escapes upload folder")
+
+    return full, norm.replace('\\', '/')
 
 def get_unique_filename(filepath):
     """Generate a unique filename if file already exists (optional overwrite logic)"""
@@ -74,9 +102,25 @@ def upload_file():
     
     #if file and allowed_file(file.filename):
     if file:
-        # Secure the filename
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        # Optional: allow uploading into a subdirectory with a relative path.
+        # This is used for directory sync; file uploads without this keep the old behavior.
+        relative_path = request.form.get('relative_path')
+
+        if relative_path:
+            try:
+                filepath, normalized_rel = resolve_path_under_upload(relative_path)
+                filename = os.path.basename(normalized_rel)
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Invalid relative_path='{relative_path}': {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid relative_path: {str(e)}'
+                }), 400
+        else:
+            # Secure the filename (legacy behavior)
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
         # Get unique filename (or same for overwriting)
         filepath = get_unique_filename(filepath)
@@ -95,6 +139,7 @@ def upload_file():
                 'filename': filename,
                 'filepath': filepath,
                 'size': file_size,
+                'relative_path': relative_path,
                 'timestamp': datetime.now().isoformat()
             }), 200
         
@@ -186,6 +231,111 @@ def delete_file(filename):
             'error': f'Error deleting file: {str(e)}'
         }), 500
 
+@app.route('/dir_files', methods=['GET'])
+def list_directory_files():
+    """
+    List all files (recursively) under a directory within the upload folder.
+    Query params:
+      - dir: relative directory under UPLOAD_FOLDER (e.g. "Photos/2025"). If omitted, uses upload root.
+    Response file paths are relative to the requested directory root.
+    """
+    try:
+        rel_dir = request.args.get('dir', '').strip()
+        if rel_dir in ('', '.'):
+            base_dir = _realpath(app.config['UPLOAD_FOLDER'])
+            dir_norm = ''
+        else:
+            base_dir, dir_norm = resolve_path_under_upload(rel_dir)
+
+        if not os.path.exists(base_dir):
+            return jsonify({
+                'success': True,
+                'dir': dir_norm,
+                'files': [],
+                'count': 0
+            }), 200
+
+        if not os.path.isdir(base_dir):
+            return jsonify({
+                'success': False,
+                'error': 'dir is not a directory',
+                'dir': dir_norm
+            }), 400
+
+        files = []
+        for root_dir, _, filenames in os.walk(base_dir):
+            for name in filenames:
+                full_path = os.path.join(root_dir, name)
+                if not os.path.isfile(full_path):
+                    continue
+                stat = os.stat(full_path)
+                rel_path = os.path.relpath(full_path, base_dir).replace('\\', '/')
+                files.append({
+                    'path': rel_path,
+                    'size': stat.st_size
+                })
+
+        return jsonify({
+            'success': True,
+            'dir': dir_norm,
+            'files': files,
+            'count': len(files)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error listing directory files: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Error listing directory files: {str(e)}'
+        }), 500
+
+@app.route('/file', methods=['DELETE'])
+def delete_file_by_path():
+    """
+    Delete a file by relative path under the upload folder.
+    Query params:
+      - path: relative path to the file (e.g. "Photos/2025/img001.jpg")
+    """
+    try:
+        rel_path = request.args.get('path')
+        if not rel_path:
+            return jsonify({
+                'success': False,
+                'error': 'path is required'
+            }), 400
+
+        filepath, norm = resolve_path_under_upload(rel_path)
+
+        if not os.path.exists(filepath):
+            return jsonify({
+                'success': False,
+                'error': 'File not found',
+                'path': norm
+            }), 404
+
+        if not os.path.isfile(filepath):
+            return jsonify({
+                'success': False,
+                'error': 'Path is not a file',
+                'path': norm
+            }), 400
+
+        os.remove(filepath)
+        logger.info(f"File deleted by path: {norm}")
+
+        return jsonify({
+            'success': True,
+            'message': 'File deleted successfully',
+            'path': norm
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error deleting file by path: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Error deleting file by path: {str(e)}'
+        }), 500
+
 @app.route('/cleanup', methods=['DELETE'])
 def cleanup_files():
     """Delete all uploaded files"""
@@ -228,6 +378,8 @@ def index():
             'upload': {'method': 'POST', 'path': '/upload', 'description': 'Upload a file'},
             'list_files': {'method': 'GET', 'path': '/files', 'description': 'List all uploaded files'},
             'delete_file': {'method': 'DELETE', 'path': '/files/<filename>', 'description': 'Delete a specific file'},
+            'list_directory_files': {'method': 'GET', 'path': '/dir_files?dir=<relative_dir>', 'description': 'List files+sizes under a directory (recursive)'},
+            'delete_file_by_path': {'method': 'DELETE', 'path': '/file?path=<relative_path>', 'description': 'Delete a file by relative path'},
             'cleanup': {'method': 'DELETE', 'path': '/cleanup', 'description': 'Delete all uploaded files'},
             'health': {'method': 'GET', 'path': '/health', 'description': 'Health check'}
         },
@@ -278,6 +430,8 @@ if __name__ == '__main__':
     print("  POST   /upload     - Upload a file")
     print("  GET    /files      - List all uploaded files")
     print("  DELETE /files/<name> - Delete a specific file")
+    print("  GET    /dir_files?dir=<relative_dir> - List files under a directory")
+    print("  DELETE /file?path=<relative_path> - Delete a file by relative path")
     print("  DELETE /cleanup    - Delete all uploaded files")
     print("  GET    /health     - Health check")
     print("  GET    /           - API information")
