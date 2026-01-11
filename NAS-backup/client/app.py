@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import threading
 from datetime import datetime
 from typing import List, Dict, Optional
+from urllib.parse import urlparse
 
 class FileBackupApp:
     def __init__(self, root):
@@ -56,6 +57,17 @@ class FileBackupApp:
             fg="white"
         )
         self.add_button.pack(side=tk.LEFT, padx=5)
+
+        # Add Directory button
+        self.add_dir_button = tk.Button(
+            button_frame,
+            text="Add Directory",
+            command=self.add_directory,
+            width=15,
+            bg="#4CAF50",
+            fg="white"
+        )
+        self.add_dir_button.pack(side=tk.LEFT, padx=5)
         
         # Remove Selected button
         self.remove_button = tk.Button(
@@ -228,6 +240,30 @@ class FileBackupApp:
             self.save_file_paths()
             self.update_treeview()
             self.update_status(f"Added: {os.path.basename(file_path)}")
+
+    def add_directory(self):
+        """Open directory dialog and add selected directory to list"""
+        dir_path = filedialog.askdirectory(title="Select a directory")
+
+        if dir_path:
+            # Normalize for stable comparisons on Windows
+            dir_path = os.path.normpath(dir_path)
+
+            # Check if already exists
+            for file_info in self.file_data:
+                if os.path.normpath(file_info['path']) == dir_path:
+                    messagebox.showinfo("Info", "Directory already in list")
+                    return
+
+            self.file_data.append({
+                'path': dir_path,
+                'last_backup': None,
+                'added_date': datetime.now().isoformat()
+            })
+
+            self.save_file_paths()
+            self.update_treeview()
+            self.update_status(f"Added directory: {os.path.basename(dir_path)}")
     
     def remove_selected(self):
         """Remove selected item from list"""
@@ -355,26 +391,36 @@ class FileBackupApp:
                 progress_value = (index / total_files) * 100
                 self.root.after(0, lambda v=progress_value: self.progress.set(v))
                 self.root.after(0, self.update_status, f"Backing up: {file_name}")
-                
-                # Prepare the file for upload
-                with open(file_path, 'rb') as f:
-                    files_data = {'file': (file_name, f)}
-                    
-                    # Send POST request
-                    response = requests.post(
-                        self.backup_url,
-                        files=files_data,
-                        timeout=30  # 30 second timeout
+
+                if os.path.isdir(file_path):
+                    uploaded, deleted = self.sync_directory(file_path)
+                    successful += 1
+                    self.root.after(
+                        0,
+                        self.update_status,
+                        f"Synced dir: {file_name} (uploaded {uploaded}, deleted {deleted})"
                     )
-                    
-                    if response.status_code == 200:
-                        successful += 1
-                        # Update backup time for this file
-                        self.root.after(0, self.update_file_backup_time, file_path)
-                        self.root.after(0, self.update_status, f"Success: {file_name}")
-                    else:
-                        failed.append(f"{file_name} (Server error: {response.status_code})")
-                        self.root.after(0, self.update_status, f"Failed: {file_name}")
+                    self.root.after(0, self.update_file_backup_time, file_path)
+                else:
+                    # Prepare the file for upload (legacy behavior)
+                    with open(file_path, 'rb') as f:
+                        files_data = {'file': (file_name, f)}
+
+                        # Send POST request
+                        response = requests.post(
+                            self.backup_url,
+                            files=files_data,
+                            timeout=30  # 30 second timeout
+                        )
+
+                        if response.status_code == 200:
+                            successful += 1
+                            # Update backup time for this file
+                            self.root.after(0, self.update_file_backup_time, file_path)
+                            self.root.after(0, self.update_status, f"Success: {file_name}")
+                        else:
+                            failed.append(f"{file_name} (Server error: {response.status_code})")
+                            self.root.after(0, self.update_status, f"Failed: {file_name}")
                         
             except requests.exceptions.RequestException as e:
                 failed.append(f"{file_name} (Network error: {str(e)})")
@@ -408,9 +454,121 @@ class FileBackupApp:
     def set_buttons_state(self, state: str):
         """Enable or disable all buttons"""
         buttons = [self.add_button, self.remove_button, 
-                  self.backup_button, self.clear_button]
+                  self.backup_button, self.clear_button, self.add_dir_button]
         for button in buttons:
             button.config(state=state)
+
+    def _base_url(self) -> str:
+        """
+        BACKUP_URL may be configured as either:
+          - http://host:8888/upload
+          - http://host:8888
+        This returns the base URL without a trailing /upload.
+        """
+        if not self.backup_url:
+            return ""
+        url = self.backup_url.rstrip('/')
+        if url.lower().endswith('/upload'):
+            return url[:-len('/upload')]
+        return url
+
+    def _remote_dir_name(self, local_dir: str) -> str:
+        # Keep remote directory names simple and portable (avoid leaking full local paths)
+        name = os.path.basename(os.path.normpath(local_dir))
+        return name if name else "dir"
+
+    def list_local_directory_files(self, dir_path: str) -> Dict[str, int]:
+        """
+        Return mapping of relative file path (forward slashes) -> size in bytes
+        for all files recursively under dir_path.
+        """
+        result: Dict[str, int] = {}
+        base = os.path.normpath(dir_path)
+        for root_dir, _, filenames in os.walk(base):
+            for name in filenames:
+                full_path = os.path.join(root_dir, name)
+                if not os.path.isfile(full_path):
+                    continue
+                rel = os.path.relpath(full_path, base).replace('\\', '/')
+                try:
+                    result[rel] = os.path.getsize(full_path)
+                except OSError:
+                    # Skip unreadable files
+                    continue
+        return result
+
+    def list_remote_directory_files(self, remote_dir: str) -> Dict[str, int]:
+        """
+        Call receiver /dir_files?dir=<remote_dir> and return mapping relpath->size.
+        Paths returned are relative to remote_dir root.
+        """
+        url = self._base_url().rstrip('/') + '/dir_files'
+        response = requests.get(url, params={'dir': remote_dir}, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f"Remote list failed: HTTP {response.status_code}")
+        payload = response.json()
+        if not payload.get('success'):
+            raise RuntimeError(f"Remote list failed: {payload.get('error')}")
+        out: Dict[str, int] = {}
+        for item in payload.get('files', []):
+            p = item.get('path')
+            s = item.get('size')
+            if isinstance(p, str) and isinstance(s, int):
+                out[p] = s
+        return out
+
+    def upload_directory_file(self, local_dir: str, rel_path: str, remote_dir: str):
+        upload_url = self._base_url().rstrip('/') + '/upload'
+        local_full = os.path.join(local_dir, rel_path.replace('/', os.sep))
+        remote_rel = f"{remote_dir}/{rel_path}".replace('\\', '/')
+        with open(local_full, 'rb') as f:
+            files_data = {'file': (os.path.basename(rel_path), f)}
+            data = {'relative_path': remote_rel}
+            resp = requests.post(upload_url, files=files_data, data=data, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Upload failed for {rel_path}: HTTP {resp.status_code}")
+        j = resp.json()
+        if not j.get('success'):
+            raise RuntimeError(f"Upload failed for {rel_path}: {j.get('error')}")
+
+    def delete_remote_file(self, remote_dir: str, rel_path: str):
+        delete_url = self._base_url().rstrip('/') + '/file'
+        remote_rel = f"{remote_dir}/{rel_path}".replace('\\', '/')
+        resp = requests.delete(delete_url, params={'path': remote_rel}, timeout=30)
+        if resp.status_code not in (200, 404):
+            raise RuntimeError(f"Delete failed for {rel_path}: HTTP {resp.status_code}")
+
+    def sync_directory(self, dir_path: str) -> (int, int):
+        """
+        Directory sync rules:
+          - If local file exists but remote doesn't: upload
+          - If remote file exists but local doesn't: delete
+          - If both exist but size differs: upload
+        """
+        remote_dir = self._remote_dir_name(dir_path)
+
+        local_files = self.list_local_directory_files(dir_path)
+        remote_files = self.list_remote_directory_files(remote_dir)
+
+        to_upload = [p for p, sz in local_files.items() if p not in remote_files or remote_files[p] != sz]
+        to_delete = [p for p in remote_files.keys() if p not in local_files]
+
+        uploaded = 0
+        deleted = 0
+
+        # Upload missing/changed
+        for rel in to_upload:
+            self.root.after(0, self.update_status, f"Uploading: {remote_dir}/{rel}")
+            self.upload_directory_file(dir_path, rel, remote_dir)
+            uploaded += 1
+
+        # Delete extras
+        for rel in to_delete:
+            self.root.after(0, self.update_status, f"Deleting: {remote_dir}/{rel}")
+            self.delete_remote_file(remote_dir, rel)
+            deleted += 1
+
+        return uploaded, deleted
     
     def on_closing(self):
         """Handle application closing"""
